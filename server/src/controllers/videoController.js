@@ -1,0 +1,773 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { pipeline } from 'node:stream';
+
+import { Video } from '../models/Video.js';
+import { uploadBodySchema } from '../middleware/validate.js';
+
+import {
+    removeFileQuietly,
+    removeVideoFiles,
+    resolveSubtitlePath,
+    resolveVideoPath
+} from '../services/storageService.js';
+
+import {
+    extractableSubtitles,
+    planConversion,
+    probeVideo
+} from '../services/transcodeService.js';
+
+import { AppError } from '../utils/AppError.js';
+
+import {
+    generateDeleteToken,
+    generateShareId,
+    hashToken,
+    tokenMatchesHash
+} from '../utils/ids.js';
+
+import { parseRange } from '../utils/range.js';
+
+import {
+    getVideoFormat,
+    hasValidVideoSignature
+} from '../utils/videoFormats.js';
+
+
+// Keep only a safe display name:
+// - no directories
+// - no control characters
+// - maximum 255 characters
+function cleanOriginalName(name) {
+    const base = name.split(/[\\/]/).pop();
+
+    // eslint-disable-next-line no-control-regex
+    return (
+        base
+            .replace(/[\u0000-\u001f\u007f]/g, '')
+            .slice(0, 255) || 'video'
+    );
+}
+
+
+// Example:
+// Breaking.Bad.S01E01.720p.mkv
+// becomes:
+// Breaking Bad S01E01 720p
+function titleFromFilename(name) {
+    return (
+        name
+            .replace(/\.[^.]+$/, '')
+            .replace(/[._]+/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 100) || 'Untitled'
+    );
+}
+
+
+// Generates the URL using the address through which the uploader
+// accessed the server.
+//
+// Example:
+// http://192.168.1.5:5000
+const siteUrl = (req) => `${req.protocol}://${req.get('host')}`;
+
+
+// Find a video or return 404.
+async function findVideoOr404(shareId) {
+    const video = await Video.findOne({ shareId });
+
+    if (!video) {
+        throw new AppError(404, 'Video not found');
+    }
+
+    return video;
+}
+
+
+export function createVideoController(config, conversionQueue) {
+
+    /**
+     * POST /api/videos/upload
+     *
+     * Multer has already streamed the uploaded file to disk.
+     *
+     * Flow:
+     *
+     * 1. File uploaded to disk
+     * 2. Validate request
+     * 3. Validate video signature
+     * 4. Run ffprobe if transcoding is enabled
+     * 5. Create MongoDB record
+     * 6. Queue conversion if required
+     *
+     * If anything fails before the upload is successfully completed,
+     * the physical file is removed.
+     */
+    async function uploadVideo(req, res) {
+        const { file } = req;
+
+        if (!file) {
+            throw new AppError(
+                400,
+                'No video file provided (use the "video" field)'
+            );
+        }
+
+        try {
+            // Validate body
+            const { title } = uploadBodySchema.parse(req.body);
+
+            // Determine the format from our own stored filename.
+            // Do not trust the client MIME type.
+            const format = getVideoFormat(file.filename);
+
+            // Validate actual file signature / magic bytes.
+            const validSignature = await hasValidVideoSignature(
+                file.path,
+                format
+            );
+
+            if (!validSignature) {
+                throw new AppError(
+                    400,
+                    `File content is not a valid ${format.ext} video`
+                );
+            }
+
+            let needsConversion = false;
+
+            // Check whether the uploaded format needs conversion.
+            if (config.transcode.enabled) {
+                let info;
+
+                try {
+                    info = await probeVideo(
+                        config.transcode.ffprobePath,
+                        file.path
+                    );
+                } catch (err) {
+                    console.error('[ffprobe] Failed:', err);
+
+                    throw new AppError(
+                        400,
+                        'Unable to read the uploaded video'
+                    );
+                }
+
+                if (!info?.video) {
+                    throw new AppError(
+                        400,
+                        'This file does not contain a readable video track'
+                    );
+                }
+
+                // Processing is needed to convert video/audio for the TV,
+                // and/or to extract text subtitle tracks as WebVTT.
+                needsConversion =
+                    planConversion(info, format.ext) !== null ||
+                    extractableSubtitles(info).length > 0;
+            }
+
+            const originalName = cleanOriginalName(
+                file.originalname
+            );
+
+            const deleteToken = generateDeleteToken();
+
+            // Create DB record.
+            const video = await Video.create({
+                shareId: generateShareId(),
+
+                title:
+                    title ??
+                    titleFromFilename(originalName),
+
+                originalName,
+
+                // Filename generated by our storage/multer layer.
+                storedName: file.filename,
+
+                // MIME type comes from our allow-listed format table.
+                mimeType: format.mimeType,
+
+                size: file.size,
+
+                status: needsConversion
+                    ? 'processing'
+                    : 'ready',
+
+                progress: needsConversion
+                    ? 0
+                    : 100,
+
+                deleteTokenHash:
+                    hashToken(deleteToken)
+            });
+
+            // Start conversion if required.
+            if (needsConversion) {
+                try {
+                    await conversionQueue.enqueue(video._id);
+                } catch (err) {
+                    console.error(
+                        `[conversion-queue] Failed for ${video.shareId}:`,
+                        err
+                    );
+
+                    // DB record should not remain stuck in processing.
+                    await Video.deleteOne({
+                        _id: video._id
+                    });
+
+                    throw new AppError(
+                        500,
+                        'Video was uploaded but processing could not be started'
+                    );
+                }
+            }
+
+            // Everything succeeded.
+            res.status(201).json({
+                success: true,
+
+                video: video.toPublicJSON(),
+
+                shareUrl:
+                    `${siteUrl(req)}/watch/${video.shareId}`,
+
+                // Returned only once.
+                deleteToken
+            });
+
+        } catch (err) {
+
+            // If upload processing fails, remove the physical file.
+            await removeFileQuietly(file.path);
+
+            throw err;
+        }
+    }
+
+
+    /**
+     * GET /api/videos
+     *
+     * Returns the video library.
+     *
+     * Limited to 1000 videos for this small project.
+     */
+    async function listVideos(req, res) {
+
+        const videos = await Video.find()
+            .sort({
+                title: 1,
+                createdAt: 1
+            })
+            .collation({
+                locale: 'en',
+                numericOrdering: true,
+                strength: 2
+            })
+            .limit(1000);
+
+        res.json({
+            success: true,
+            videos: videos.map(
+                (video) => video.toPublicJSON()
+            )
+        });
+    }
+
+
+    /**
+     * GET /api/videos/:shareId
+     *
+     * Returns metadata only.
+     *
+     * Never expose the physical storage path.
+     */
+    async function getVideo(req, res) {
+
+        const video = await findVideoOr404(
+            req.params.shareId
+        );
+
+        res.json({
+            success: true,
+            video: video.toPublicJSON()
+        });
+    }
+
+
+    /**
+     * GET /api/videos/:shareId/stream
+     *
+     * HTTP Range based video streaming.
+     *
+     * Example:
+     *
+     * Range: bytes=0-999999
+     *
+     * Response:
+     *
+     * 206 Partial Content
+     *
+     * Only the requested part of the 5 GB movie is read.
+     */
+    async function streamVideo(req, res) {
+
+        const video = await findVideoOr404(
+            req.params.shareId
+        );
+
+        // Do not allow streaming while conversion is running.
+        if (video.status === 'processing') {
+            throw new AppError(
+                409,
+                'Video is still being processed'
+            );
+        }
+
+        // NOTE: 'failed' videos ARE streamed on purpose. A failed conversion keeps the
+        // original file so it can still be downloaded (the watch page offers a
+        // Download button for VLC) or played by browsers that happen to support it.
+
+        const filePath = resolveVideoPath(
+            config.storageDir,
+            video.storedName
+        );
+
+        let fileSize;
+
+        try {
+            const stat = await fs.promises.stat(
+                filePath
+            );
+
+            fileSize = stat.size;
+
+        } catch (err) {
+
+            console.error(
+                `[stream] Unable to access ${video.shareId}:`,
+                err
+            );
+
+            throw new AppError(
+                404,
+                'Video file is unavailable'
+            );
+        }
+
+        // Prevent invalid zero-byte files.
+        if (fileSize <= 0) {
+            throw new AppError(
+                404,
+                'Video file is empty'
+            );
+        }
+
+        res.set(
+            'Accept-Ranges',
+            'bytes'
+        );
+
+        const rangeHeader =
+            req.headers.range;
+
+        let start = 0;
+        let end = fileSize - 1;
+
+
+        // Browser requested a specific range.
+        if (rangeHeader) {
+
+            const range = parseRange(
+                rangeHeader,
+                fileSize,
+                config.streamChunkBytes
+            );
+
+            if (!range) {
+
+                res.set(
+                    'Content-Range',
+                    `bytes */${fileSize}`
+                );
+
+                throw new AppError(
+                    416,
+                    'Requested range not satisfiable'
+                );
+            }
+
+            ({
+                start,
+                end
+            } = range);
+
+            res.status(206);
+
+            res.set(
+                'Content-Range',
+                `bytes ${start}-${end}/${fileSize}`
+            );
+
+        } else {
+
+            // Full file request.
+            res.status(200);
+        }
+
+
+        // Optional download mode.
+        //
+        // /stream?download=1
+        //
+        // Browser will download the file instead of
+        // displaying it inline.
+        if (req.query.download === '1') {
+
+            const extension =
+                path.extname(video.storedName);
+
+            const downloadName =
+                video.originalName.replace(
+                    /\.[^.]+$/,
+                    ''
+                ) + extension;
+
+            res.attachment(downloadName);
+        }
+
+
+        res.set(
+            'Content-Type',
+            video.mimeType
+        );
+
+        res.set(
+            'Content-Length',
+            String(end - start + 1)
+        );
+
+        res.set(
+            'Cache-Control',
+            'private, max-age=3600'
+        );
+
+
+        // HEAD request:
+        // send headers only.
+        if (req.method === 'HEAD') {
+            return res.end();
+        }
+
+
+        // IMPORTANT:
+        // Do not use fs.readFile() here.
+        //
+        // createReadStream() allows a 5 GB movie
+        // to be streamed without loading 5 GB into RAM.
+        const fileStream =
+            fs.createReadStream(
+                filePath,
+                {
+                    start,
+                    end,
+                    highWaterMark:
+                        64 * 1024
+                }
+            );
+
+
+        pipeline(
+            fileStream,
+            res,
+            (err) => {
+
+                if (!err) {
+                    return;
+                }
+
+                // User seeking, closing the tab,
+                // changing video, etc.
+                //
+                // These are normal stream interruptions.
+                if (
+                    err.code ===
+                    'ERR_STREAM_PREMATURE_CLOSE'
+                ) {
+                    return;
+                }
+
+                console.error(
+                    `[stream] ${video.shareId}:`,
+                    err
+                );
+            }
+        );
+    }
+
+
+    /**
+     * DELETE /api/videos/:shareId
+     *
+     * Requires:
+     *
+     * X-Delete-Token: <token>
+     *
+     * Flow:
+     *
+     * 1. Find video
+     * 2. Validate delete token
+     * 3. Stop conversion
+     * 4. Delete DB record
+     * 5. Delete physical file
+     */
+    async function deleteVideo(req, res) {
+
+        const video =
+            await Video.findOne({
+                shareId: req.params.shareId
+            }).select('+deleteTokenHash');
+
+
+        if (!video) {
+            throw new AppError(
+                404,
+                'Video not found'
+            );
+        }
+
+
+        const deleteToken =
+            req.get('X-Delete-Token');
+
+
+        if (
+            !tokenMatchesHash(
+                deleteToken,
+                video.deleteTokenHash
+            )
+        ) {
+            throw new AppError(
+                403,
+                'Delete token is not valid for this video'
+            );
+        }
+
+
+        // Stop FFmpeg first.
+        //
+        // This is especially important on Windows
+        // because an open file can prevent deletion.
+        try {
+
+            await conversionQueue.cancel(
+                video._id
+            );
+
+        } catch (err) {
+
+            console.error(
+                `[delete] Failed to cancel conversion for ${video.shareId}:`,
+                err
+            );
+
+            throw new AppError(
+                500,
+                'Unable to stop video processing'
+            );
+        }
+
+
+        // Delete DB record.
+        const deleted =
+            await Video.findOneAndDelete({
+                _id: video._id
+            });
+
+
+        if (!deleted) {
+            throw new AppError(
+                404,
+                'Video was already deleted'
+            );
+        }
+
+
+        // Delete physical video file and its subtitle files.
+        const fileRemoved =
+            await removeVideoFiles(
+                config.storageDir,
+                deleted
+            );
+
+
+        // DB record is already gone.
+        // If file deletion failed, cleanup job can remove it later.
+        if (!fileRemoved) {
+
+            console.warn(
+                `[delete] Orphan file left for cleanup: ${deleted.storedName}`
+            );
+        }
+
+
+        res.json({
+            success: true,
+            message: 'Video deleted'
+        });
+    }
+
+
+    /**
+     * DELETE ALL VIDEOS
+     *
+     * IMPORTANT:
+     * This endpoint must be protected by authentication/
+     * authorization at the route level.
+     */
+    async function deleteAllVideos(req, res) {
+
+        const videos =
+            await Video.find();
+
+
+        let deletedCount = 0;
+        let failedFileDeletes = 0;
+
+
+        for (const video of videos) {
+
+            // Stop conversion first.
+            try {
+
+                await conversionQueue.cancel(
+                    video._id
+                );
+
+            } catch (err) {
+
+                console.error(
+                    `[delete-all] Failed to cancel conversion for ${video.shareId}:`,
+                    err
+                );
+
+                // Don't continue deleting this video's DB record
+                // if FFmpeg may still be using its files.
+                continue;
+            }
+
+
+            // Delete DB record.
+            //
+            // Re-read the record while deleting: a conversion that finished
+            // between Video.find() and cancel() may have swapped in a new
+            // storedName (.mp4). Using the old `video.storedName` would delete
+            // an already-removed file and orphan the new one.
+            const deleted =
+                await Video.findOneAndDelete({
+                    _id: video._id
+                });
+
+
+            if (!deleted) {
+                continue;
+            }
+
+
+            deletedCount++;
+
+
+            // Delete physical video file and its subtitle files.
+            const fileRemoved =
+                await removeVideoFiles(
+                    config.storageDir,
+                    deleted
+                );
+
+
+            if (!fileRemoved) {
+
+                failedFileDeletes++;
+
+                console.warn(
+                    `[delete-all] Orphan file left for cleanup: ${deleted.storedName}`
+                );
+            }
+        }
+
+
+        res.json({
+            success: true,
+            message: 'Videos deleted',
+            deletedCount,
+            failedFileDeletes
+        });
+    }
+
+
+    /**
+     * GET /api/videos/:shareId/subtitles/:index
+     *
+     * One WebVTT subtitle track, for <track src="...">.
+     * The index comes from the public metadata (0, 1, 2 ...);
+     * the stored filename is never exposed.
+     */
+    async function getSubtitle(req, res) {
+
+        if (!/^\d{1,2}$/.test(req.params.index)) {
+            throw new AppError(
+                400,
+                'Invalid subtitle index'
+            );
+        }
+
+        const video = await findVideoOr404(
+            req.params.shareId
+        );
+
+        const subtitle =
+            video.subtitles?.[Number(req.params.index)];
+
+        if (!subtitle) {
+            throw new AppError(
+                404,
+                'Subtitle track not found'
+            );
+        }
+
+        res.set(
+            'Content-Type',
+            'text/vtt; charset=utf-8'
+        );
+
+        res.set(
+            'Cache-Control',
+            'private, max-age=3600'
+        );
+
+        res.sendFile(
+            resolveSubtitlePath(
+                config.storageDir,
+                subtitle.file
+            )
+        );
+    }
+
+
+    return {
+        uploadVideo,
+        listVideos,
+        getVideo,
+        getSubtitle,
+        streamVideo,
+        deleteVideo,
+        deleteAllVideos
+    };
+}

@@ -1,0 +1,21 @@
+{
+  "name": "strivo",
+  "private": true,
+  "description": "Small MERN app for privately sharing videos — a system-design learning project",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,green \"npm run dev -w server\" \"npm run dev -w client\"",
+    "start": "npm run build -w client && npm start -w server",
+    "test": "npm test -w server && npm test -w client",
+    "cleanup": "npm run cleanup -w server"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.5"
+  }
+}
