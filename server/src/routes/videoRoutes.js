@@ -21,6 +21,8 @@ export function createVideoRouter(config, conversionQueue) {
   router.get('/:shareId/subtitles/:index', apiLimiter, validateShareId, controller.getSubtitle);
   router.get('/:shareId', apiLimiter, validateShareId, controller.getVideo);
   router.delete('/:shareId', apiLimiter, validateShareId, requireDeleteToken, controller.deleteVideo);
+  // Delete all videos — confirmation is handled in the UI ("Are you sure?").
+  router.delete('/', apiLimiter, controller.deleteAllVideos);
 
   return router;
 }

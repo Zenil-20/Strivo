@@ -68,6 +68,10 @@ export const extractableSubtitles = (info) => info.subtitles.filter((s) => s.isT
  * re-encoded ("encode" = CPU-heavy, especially video).
  */
 export function planConversion(info, ext) {
+  // Guard: probeVideo() returns video:null for audio-only or unreadable containers.
+  // The upload controller already rejects such files, but the conversion worker
+  // calls this function too — a crash here would silently freeze the job.
+  if (!info.video) return null;
   const videoOk = TV_VIDEO_CODECS.has(info.video.codec) && TV_PIXEL_FORMATS.has(info.video.pixelFormat);
   const audioOk = !info.audio || TV_AUDIO_CODECS.has(info.audio.codec);
   if (videoOk && audioOk && TV_CONTAINERS.has(ext)) return null;

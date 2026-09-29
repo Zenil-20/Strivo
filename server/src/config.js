@@ -62,7 +62,12 @@ export function loadConfig(env = process.env) {
     maxVideoSizeBytes: e.MAX_VIDEO_SIZE_MB ? e.MAX_VIDEO_SIZE_MB * MB : null, // null = unlimited
     minFreeDiskBytes: e.MIN_FREE_DISK_MB * MB,
     maxConcurrentStreams: e.MAX_CONCURRENT_STREAMS,
-    streamChunkBytes: e.STREAM_CHUNK_SIZE_MB ? Math.floor(e.STREAM_CHUNK_SIZE_MB * MB) : Infinity,
+    // 0 → Infinity (no cap). A sub-1-byte decimal value would floor to 0, which
+    // would make every range request return 416; enforce a 1-byte minimum so the
+    // calculation in parseRange always produces a valid end >= start.
+    streamChunkBytes: e.STREAM_CHUNK_SIZE_MB
+      ? Math.max(Math.floor(e.STREAM_CHUNK_SIZE_MB * MB), 1)
+      : Infinity,
     // Fixed on the server. The client can never influence where files go.
     storageDir: path.join(serverRoot, 'storage', 'videos'),
     // The built React app (npm run build -w client). Served by Express when present,

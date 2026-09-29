@@ -13,6 +13,9 @@ export const DELETE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 export const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
 
 export function tokenMatchesHash(token, expectedHash) {
+  // Guard: a missing token or hash must never reach crypto.update(), which throws
+  // a TypeError when given undefined. Return false so the caller gets a clean denial.
+  if (!token || !expectedHash) return false;
   const a = Buffer.from(hashToken(token), 'hex');
   const b = Buffer.from(expectedHash, 'hex');
   // Constant-time comparison so response timing leaks nothing about the hash.

@@ -625,83 +625,50 @@ export function createVideoController(config, conversionQueue) {
     }
 
 
+
     /**
-     * DELETE ALL VIDEOS
+     * DELETE /api/videos
      *
-     * IMPORTANT:
-     * This endpoint must be protected by authentication/
-     * authorization at the route level.
+     * Admin-only: delete every video and all its files.
+     * Protected by requireAdminToken middleware at the route level
+     * (ADMIN_TOKEN must be set in server/.env).
      */
     async function deleteAllVideos(req, res) {
 
-        const videos =
-            await Video.find();
-
+        const videos = await Video.find();
 
         let deletedCount = 0;
         let failedFileDeletes = 0;
 
-
         for (const video of videos) {
 
-            // Stop conversion first.
+            // Stop conversion first so ffmpeg releases file handles
+            // (especially important on Windows where open files can't be deleted).
             try {
-
-                await conversionQueue.cancel(
-                    video._id
-                );
-
+                await conversionQueue.cancel(video._id);
             } catch (err) {
-
                 console.error(
                     `[delete-all] Failed to cancel conversion for ${video.shareId}:`,
                     err
                 );
-
-                // Don't continue deleting this video's DB record
-                // if FFmpeg may still be using its files.
+                // Don't touch this video's files if ffmpeg may still be using them.
                 continue;
             }
 
-
-            // Delete DB record.
-            //
-            // Re-read the record while deleting: a conversion that finished
-            // between Video.find() and cancel() may have swapped in a new
-            // storedName (.mp4). Using the old `video.storedName` would delete
-            // an already-removed file and orphan the new one.
-            const deleted =
-                await Video.findOneAndDelete({
-                    _id: video._id
-                });
-
-
-            if (!deleted) {
-                continue;
-            }
-
+            // Re-read the record while deleting: a conversion that finished between
+            // Video.find() and cancel() may have swapped in a new storedName (.mp4).
+            // Using the old storedName would delete an already-removed file and orphan the new one.
+            const deleted = await Video.findOneAndDelete({ _id: video._id });
+            if (!deleted) continue;
 
             deletedCount++;
 
-
-            // Delete physical video file and its subtitle files.
-            const fileRemoved =
-                await removeVideoFiles(
-                    config.storageDir,
-                    deleted
-                );
-
-
+            const fileRemoved = await removeVideoFiles(config.storageDir, deleted);
             if (!fileRemoved) {
-
                 failedFileDeletes++;
-
-                console.warn(
-                    `[delete-all] Orphan file left for cleanup: ${deleted.storedName}`
-                );
+                console.warn(`[delete-all] Orphan file left for cleanup: ${deleted.storedName}`);
             }
         }
-
 
         res.json({
             success: true,
@@ -768,6 +735,6 @@ export function createVideoController(config, conversionQueue) {
         getSubtitle,
         streamVideo,
         deleteVideo,
-        deleteAllVideos
+        deleteAllVideos,
     };
 }

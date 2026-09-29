@@ -48,6 +48,11 @@ export function createUploadMiddleware(config) {
  */
 export function createDiskSpaceGuard(config) {
   return async function diskSpaceGuard(req, res, next) {
+    // Content-Length is absent for chunked transfer encoding (some browsers and
+    // upload tools omit it). In that case incomingBytes = 0 and the guard passes.
+    // This is an inherent HTTP/1.1 limitation: the full body size is not known
+    // until all chunks arrive. The guard is still effective for the common case
+    // of a browser sending a standard multipart upload with Content-Length.
     const incomingBytes = Number(req.get('Content-Length')) || 0;
     const { bavail, bsize } = await fs.statfs(config.storageDir);
     if (incomingBytes + config.minFreeDiskBytes > bavail * bsize) {
