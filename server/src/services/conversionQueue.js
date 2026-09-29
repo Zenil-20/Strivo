@@ -145,14 +145,16 @@ export function createConversionQueue(config) {
     current.done = convert(id).catch((err) => console.error(`[convert] unexpected error: ${err.message}`));
     await current.done;
     current = null;
-    runNext();
+    // Tail call: must also be guarded so a throw here doesn't surface as an
+    // unhandled rejection (the caller may have already released its .catch chain).
+    runNext().catch((err) => console.error(`[convert] queue error: ${err.message}`));
   }
 
   return {
     enqueue(id) {
       const key = String(id);
       if (!pending.includes(key) && current?.id !== key) pending.push(key);
-      runNext();
+      runNext().catch((err) => console.error(`[convert] queue error: ${err.message}`));
     },
     /** Stop (or un-queue) a conversion, e.g. because the video is being deleted. */
     async cancel(id) {

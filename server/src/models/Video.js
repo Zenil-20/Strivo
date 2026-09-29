@@ -29,6 +29,12 @@ const videoSchema = new mongoose.Schema(
         },
       ],
       default: [],
+      // Defence-in-depth: the service layer already caps at MAX_SUBTITLE_TRACKS (20),
+      // but enforce the limit at the model boundary so direct DB writes can't bypass it.
+      validate: {
+        validator: (arr) => arr.length <= 20,
+        message: 'A video may have at most 20 subtitle tracks',
+      },
     },
     // SHA-256 of the uploader's delete token. Excluded from queries by default.
     deleteTokenHash: { type: String, required: true, select: false },

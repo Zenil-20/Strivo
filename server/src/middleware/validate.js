@@ -24,7 +24,7 @@ export function validateShareId(req, res, next) {
 
 export function requireDeleteToken(req, res, next) {
   if (!deleteTokenSchema.safeParse(req.get('X-Delete-Token')).success) {
-    return next(new AppError(401, 'A valid delete token is required'));
+    return next(new AppError(403, 'A valid delete token is required'));
   }
   next();
 }

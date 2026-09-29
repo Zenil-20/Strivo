@@ -67,6 +67,13 @@ export async function deleteVideo(shareId, deleteToken) {
   return readJson(res);
 }
 
+export async function deleteAllVideos() {
+  const res = await fetch(`${API_URL}/api/videos`, {
+    method: 'DELETE',
+  });
+  return readJson(res);
+}
+
 // The <video> element fetches this URL itself, using Range requests.
 export const getStreamUrl = (shareId) => `${API_URL}/api/videos/${encodeURIComponent(shareId)}/stream`;
 export const getDownloadUrl = (shareId) => `${getStreamUrl(shareId)}?download=1`;

@@ -38,6 +38,11 @@ export function parseRange(header, fileSize, maxChunk) {
 
   if (start >= fileSize || start > end) return null;
 
+  // Safety: a zero or negative maxChunk (e.g. from a misconfigured env var that
+  // rounds to 0 after Math.floor) would produce end = start - 1, which is invalid.
+  // config.js enforces a minimum of 1, but guard here too as defence in depth.
+  if (maxChunk <= 0) return null;
+
   end = Math.min(end, start + maxChunk - 1);
   return { start, end };
 }

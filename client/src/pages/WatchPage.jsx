@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router';
+import { Link, useNavigate, useParams } from 'react-router';
 import ProgressBar from '../components/ProgressBar.jsx';
 import {
+  deleteVideo,
+  forgetDeleteToken,
   formatBytes,
+  getDeleteToken,
   getDownloadUrl,
   getResumeTime,
   getStreamUrl,
@@ -25,15 +28,21 @@ const MEDIA_ERRORS = {
 
 export default function WatchPage() {
   const { shareId } = useParams();
+  const navigate = useNavigate();
   const [video, setVideo] = useState(null);
   const [error, setError] = useState('');
   const [playerError, setPlayerError] = useState('');
   const [playerKey, setPlayerKey] = useState(0); // bump to remount <video> on retry
+  const [deleteError, setDeleteError] = useState('');
+  const [deleteRunning, setDeleteRunning] = useState(false);
   const videoRef = useRef(null);
   const [subtitleIndex, setSubtitleIndex] = useState(-1); // -1 = subtitles off
   const subtitles = video?.subtitles ?? [];
   const subtitleIndexRef = useRef(-1);
   subtitleIndexRef.current = subtitleIndex;
+
+  // Only show Delete on the device that did the upload (has the token in localStorage).
+  const deleteToken = video ? getDeleteToken(video.id) : null;
 
   // Start with the language chosen last time on this device (if this video has it).
   useEffect(() => {
@@ -60,12 +69,23 @@ export default function WatchPage() {
   useEffect(() => {
     let cancelled = false;
     let timer;
+    let prevStatus = null;
     async function load() {
       try {
         const data = await getVideo(shareId);
         if (cancelled) return;
         setVideo(data.video);
-        if (data.video.status === 'processing') timer = setTimeout(load, 3000);
+        const status = data.video.status;
+        if (status === 'processing') {
+          // Keep polling until the conversion finishes.
+          timer = setTimeout(load, 3000);
+        } else if (prevStatus === 'processing') {
+          // Status just changed from 'processing' → 'ready' or 'failed'.
+          // One extra fetch after a short delay ensures the final state
+          // (e.g. the 'failed' error banner) is visible without a manual reload.
+          timer = setTimeout(load, 1000);
+        }
+        prevStatus = status;
       } catch (err) {
         if (!cancelled) setError(err.message);
       }
@@ -116,12 +136,21 @@ export default function WatchPage() {
         case 'Subtitle': // subtitle key on some remotes
           cycleSubtitlesRef.current();
           break;
+        case 'Escape':
+        case 'Backspace':
+        case 'BrowserBack':
+        case 'GoBack':
+          if (!onControl) {
+            e.preventDefault();
+            navigate('/');
+          }
+          break;
         default:
       }
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [navigate]);
 
   function onLoadedMetadata(e) {
     setPlayerError('');
@@ -141,6 +170,21 @@ export default function WatchPage() {
     if (Math.abs(t - lastSaved.current) >= 5) {
       lastSaved.current = t;
       setResumeTime(shareId, t);
+    }
+  }
+
+  async function onDelete() {
+    if (!deleteToken) return;
+    setDeleteRunning(true);
+    setDeleteError('');
+    try {
+      await deleteVideo(video.id, deleteToken);
+      forgetDeleteToken(video.id);
+      setResumeTime(shareId, 0); // clear saved position
+      navigate('/');
+    } catch (err) {
+      setDeleteError(err.message);
+      setDeleteRunning(false);
     }
   }
 
@@ -170,7 +214,7 @@ export default function WatchPage() {
   return (
     <section className="watch">
       <div className="watch-header">
-        <Link to="/" className="button secondary">← Library</Link>
+        <Link to="/" className="button secondary" data-tile>← Library</Link>
         <h1>{video.title}</h1>
       </div>
       {video.status === 'failed' && (
@@ -218,18 +262,35 @@ export default function WatchPage() {
       )}
       <div className="watch-footer">
         <div className="actions player-actions">
-          <button type="button" onClick={() => toggleFullscreen(videoRef.current)}>⛶ Fullscreen</button>
+          <button type="button" onClick={() => toggleFullscreen(videoRef.current)} data-tile>⛶ Fullscreen</button>
           {subtitles.length > 0 && (
-            <button type="button" className="secondary" onClick={cycleSubtitles} aria-live="polite">
+            <button type="button" className="secondary" onClick={cycleSubtitles} aria-live="polite" data-tile>
               CC Subtitles: {subtitleIndex === -1 ? 'Off' : subtitles[subtitleIndex]?.label}
             </button>
           )}
-          <a className="button secondary" href={getDownloadUrl(shareId)}>Download</a>
+          <a className="button secondary" href={getDownloadUrl(shareId)} data-tile>Download</a>
+          {deleteToken && (
+            <button
+              type="button"
+              className="secondary danger"
+              onClick={onDelete}
+              disabled={deleteRunning}
+              title="Delete this video (only visible on the device that uploaded it)"
+              data-tile
+            >
+              {deleteRunning ? 'Deleting…' : '🗑 Delete'}
+            </button>
+          )}
         </div>
-        <span className="muted small">
-          OK = play/pause · ◀ ▶ = 10 s{subtitles.length > 0 ? ' · S = subtitles' : ''} · F = fullscreen ·{' '}
-          {formatBytes(video.size)}
-        </span>
+        {deleteError && <p className="error small">{deleteError}</p>}
+        <div className="remote-hints-bar">
+          <span className="remote-hint"><kbd>OK</kbd> Play / Pause</span>
+          <span className="remote-hint"><kbd>◀ ▶</kbd> Skip 10s</span>
+          <span className="remote-hint"><kbd>Back</kbd> Library</span>
+          {subtitles.length > 0 && <span className="remote-hint"><kbd>S</kbd> Subtitles</span>}
+          <span className="remote-hint"><kbd>F</kbd> Fullscreen</span>
+          <span className="remote-hint-size">{formatBytes(video.size)}</span>
+        </div>
       </div>
     </section>
   );
